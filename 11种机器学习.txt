@@ -1,0 +1,1988 @@
+############################################################
+## 0. 环境准备与参数设定
+############################################################
+
+## 数据路径（按需修改）
+COUNT_FILE <- "F:/BULK_机器学习/SL_gene_count_matrix.csv"
+META_FILE  <- "F:/BULK_机器学习/sample.txt"
+
+## 输出目录
+outdir <- "F:/BULK_机器学习/integrated_pipeline_output/"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+## 如第一次运行，先装包（按需取消注释）
+# install.packages(c(
+#   "tidyverse","glmnet","randomForest","xgboost","ggvenn",
+#   "pheatmap","edgeR","rstatix","caret","lightgbm","pls",
+#   "gbm","FNN","e1071","rpart","UpSetR","ggridges",
+#   "rBayesianOptimization","reticulate","keras","tensorflow",
+#   "VennDiagram","patchwork","parallel","readr",
+#   "gridExtra","doParallel"
+# ))
+
+library(tidyverse)
+library(glmnet)
+library(randomForest)
+library(xgboost)
+library(ggvenn)
+library(pheatmap)
+library(edgeR)        # cpm()
+library(rstatix)
+library(caret)        # createFolds()
+library(lightgbm)
+library(pls)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(ggplot2)
+library(gbm)
+library(FNN)
+library(e1071)
+library(rpart)
+library(UpSetR)
+library(ggridges)
+library(readr)
+library(grid)        # for unit()
+library(gridExtra)   # for grid.arrange()
+library(doParallel)  # for registerDoParallel()
+
+set.seed(42)
+
+############################################################
+## 1. 数据预处理：count → CPM → log2CPM，定义 X_full / y_full
+############################################################
+
+## 1.1 读入原始 count 矩阵和样本信息 -----------------------
+stopifnot(file.exists(COUNT_FILE), file.exists(META_FILE))
+
+count_raw <- read.csv(COUNT_FILE,
+                      header = TRUE, row.names = 1, check.names = FALSE)
+meta <- read.table(META_FILE,
+                   header = TRUE, stringsAsFactors = FALSE)
+
+stopifnot(identical(colnames(count_raw), meta$sample))
+
+## 1.2 过滤低表达基因 + CPM 归一化 -------------------------
+keep <- rowSums(cpm(count_raw) > 1) >= floor(0.4 * nrow(meta))
+count_filt <- count_raw[keep, ]
+
+## 1.3 log2(CPM+1) 表达矩阵 --------------------------------
+cpm_mat <- cpm(count_filt, log = TRUE)  # 行 = 基因，列 = 样本
+cpm_df  <- as.data.frame(t(cpm_mat))    # 行 = 样本，列 = 基因
+
+## 1.4 全数据的响应变量 y_full 和特征矩阵 X_full ------------
+y_full <- meta$day                    # 干旱天数（连续）
+X_full <- as.matrix(cpm_df)           # 样本 × 基因
+
+stopifnot(nrow(X_full) == length(y_full))
+
+## 保存一份全数据备份，后面会在 train+val 上建模，再恢复
+X_all   <- X_full
+y_all   <- y_full
+meta_all <- meta
+
+############################################################
+## 1B. 时间序列感知切分：train / val / test（防止时间泄露）
+############################################################
+
+time_series_split_days <- function(days, train_ratio = 0.6, val_ratio = 0.2) {
+  stopifnot(length(days) > 0)
+  uniq_d <- sort(unique(days))
+  nd <- length(uniq_d)
+  if (nd < 3) {
+    warning("时间点数量 < 3，无法进行 60/20/20 切分，将使用简单 70/30 划分样本。")
+    n <- length(days)
+    idx <- seq_len(n)
+    n_train <- floor(0.7 * n)
+    idx_train <- idx[1:n_train]
+    idx_test  <- idx[(n_train+1):n]
+    return(list(
+      train = idx_train,
+      val   = integer(0),
+      test  = idx_test,
+      train_days = sort(unique(days[idx_train])),
+      val_days   = integer(0),
+      test_days  = sort(unique(days[idx_test]))
+    ))
+  }
+  n_train_days <- max(1, floor(nd * train_ratio))
+  n_val_days   <- max(1, floor(nd * val_ratio))
+  n_test_days  <- nd - n_train_days - n_val_days
+  if (n_test_days <= 0) {
+    n_val_days  <- max(1, nd - n_train_days - 1)
+    n_test_days <- nd - n_train_days - n_val_days
+  }
+  train_days <- uniq_d[1:n_train_days]
+  val_days   <- uniq_d[(n_train_days+1):(n_train_days+n_val_days)]
+  test_days  <- uniq_d[(n_train_days+n_val_days+1):nd]
+  
+  idx_train <- which(days %in% train_days)
+  idx_val   <- which(days %in% val_days)
+  idx_test  <- which(days %in% test_days)
+  
+  list(
+    train = idx_train,
+    val   = idx_val,
+    test  = idx_test,
+    train_days = train_days,
+    val_days   = val_days,
+    test_days  = test_days
+  )
+}
+
+split <- time_series_split_days(y_full, train_ratio = 0.6, val_ratio = 0.2)
+
+idx_train <- split$train
+idx_val   <- split$val
+idx_test  <- split$test
+
+cat("时间序列切分结果：\n")
+cat("  Train 样本数:", length(idx_train), "  时间点:",
+    paste(range(split$train_days), collapse = " - "), "\n")
+cat("  Val   样本数:", length(idx_val),   "  时间点:",
+    ifelse(length(split$val_days)>0,
+           paste(range(split$val_days), collapse = " - "),
+           "无"), "\n")
+cat("  Test  样本数:", length(idx_test),  "  时间点:",
+    ifelse(length(split$test_days)>0,
+           paste(range(split$test_days), collapse = " - "),
+           "无"), "\n\n")
+
+idx_trainval <- sort(c(idx_train, idx_val))
+
+## train+val 数据，用于多模型比较 / AUCτ / LOPO / PC1 / 共识基因
+X <- X_all[idx_trainval, , drop = FALSE]
+y <- y_all[idx_trainval]
+meta <- meta_all[idx_trainval, , drop = FALSE]
+
+## 独立 test，用于最终泛化评估（只用最佳模型）
+X_test  <- X_all[idx_test, , drop = FALSE]
+y_test  <- y_all[idx_test]
+meta_test <- meta_all[idx_test, , drop = FALSE]
+
+############################################################
+## 1C. 一些公共辅助函数
+############################################################
+
+## KNN / SVM 用到：按训练集参数标准化
+scale_by_train <- function(Xtr, Xte) {
+  mu <- colMeans(Xtr)
+  sdv <- apply(Xtr, 2, sd)
+  sdv[sdv == 0 | is.na(sdv)] <- 1
+  list(
+    Xtr = sweep(sweep(Xtr, 2, mu, "-"), 2, sdv, "/"),
+    Xte = sweep(sweep(Xte, 2, mu, "-"), 2, sdv, "/")
+  )
+}
+
+## 简单积分（AUCτ）
+trapz <- function(x, y) sum((head(y, -1) + tail(y, -1)) * diff(x) / 2)
+
+############################################################
+## 2. 多模型回归（11 模型）+ 5 折交叉验证 + AUCτ
+##    在 train+val 上进行，用于模型比较 + 特征重要性
+############################################################
+
+topN <- 500          # 各模型 TopN 基因，用于后续整合
+set.seed(42)
+
+## 2.1 5 折划分（仅基于 train+val）
+folds <- createFolds(y, k = 5, returnTrain = FALSE)
+algo_res <- list()   # 存各模型的预测和 TopN 基因
+
+n_trainval <- length(y)
+
+############################################################
+## 2.2 各模型：LASSO / Elastic / Ridge / RF / XGB / LGB / GBM
+##             KNN / SVM / DecisionTree / NaiveBayes
+############################################################
+
+#### 2.2.1 LASSO ------------------------------------------------
+pred_lasso <- numeric(n_trainval)
+for (fd in folds) {
+  fit_cv <- cv.glmnet(X[-fd, ], y[-fd], family = "gaussian",
+                      alpha = 1, nfolds = 5)
+  pred_lasso[fd] <- as.numeric(
+    predict(fit_cv, newx = X[fd, ], s = "lambda.min")
+  )
+}
+fit_all <- cv.glmnet(X, y, family = "gaussian", alpha = 1, nfolds = 5)
+coef_mat <- coef(fit_all, s = "lambda.min")
+gene <- setdiff(rownames(coef_mat)[as.vector(coef_mat != 0)], "(Intercept)")
+w <- abs(as.vector(coef_mat[gene, , drop = FALSE]))
+gene <- head(gene[order(-w)], topN)
+algo_res$LASSO <- list(pred = pred_lasso, gene = gene)
+
+#### 2.2.2 Elastic-Net -----------------------------------------
+pred_elastic <- numeric(n_trainval)
+for (fd in folds) {
+  fit_cv <- cv.glmnet(X[-fd, ], y[-fd], family = "gaussian",
+                      alpha = 0.5, nfolds = 5)
+  pred_elastic[fd] <- as.numeric(
+    predict(fit_cv, newx = X[fd, ], s = "lambda.min")
+  )
+}
+fit_all <- cv.glmnet(X, y, family = "gaussian", alpha = 0.5, nfolds = 5)
+coef_mat <- coef(fit_all, s = "lambda.min")
+gene <- setdiff(rownames(coef_mat)[as.vector(coef_mat != 0)], "(Intercept)")
+w <- abs(as.vector(coef_mat[gene, , drop = FALSE]))
+gene <- head(gene[order(-w)], topN)
+algo_res$Elastic <- list(pred = pred_elastic, gene = gene)
+
+#### 2.2.3 Ridge ------------------------------------------------
+pred_ridge <- numeric(n_trainval)
+for (fd in folds) {
+  fit_cv <- cv.glmnet(X[-fd, ], y[-fd], family = "gaussian",
+                      alpha = 0, nfolds = 5)
+  pred_ridge[fd] <- as.numeric(
+    predict(fit_cv, newx = X[fd, ], s = "lambda.min")
+  )
+}
+fit_all <- cv.glmnet(X, y, family = "gaussian", alpha = 0, nfolds = 5)
+coef_mat <- coef(fit_all, s = "lambda.min")
+gene_all <- setdiff(rownames(coef_mat), "(Intercept)")
+w <- abs(as.vector(coef_mat[gene_all, , drop = FALSE]))
+gene <- head(gene_all[order(-w)], topN)
+algo_res$Ridge <- list(pred = pred_ridge, gene = gene)
+
+#### 2.2.4 Random Forest ----------------------------------------
+pred_rf <- numeric(n_trainval)
+for (fd in folds) {
+  ntr <- nrow(X[-fd, , drop = FALSE])
+  fit <- randomForest(
+    x = X[-fd, , drop = FALSE], y = y[-fd],
+    ntree = 1500,
+    nodesize = max(3, floor(ntr * 0.05)),
+    maxnodes = 64,
+    importance = TRUE
+  )
+  pred_rf[fd] <- predict(fit, newdata = X[fd, , drop = FALSE])
+}
+fit_all <- randomForest(
+  x = X, y = y,
+  ntree = 1500,
+  nodesize = max(3, floor(nrow(X) * 0.05)),
+  maxnodes = 64,
+  importance = TRUE
+)
+rf_imp <- importance(fit_all, type = 1)[, 1]
+gene <- head(names(sort(rf_imp, decreasing = TRUE)), topN)
+algo_res$RF <- list(pred = pred_rf, gene = gene)
+
+#### 2.2.5 XGBoost ----------------------------------------------
+pred_xgb <- numeric(n_trainval)
+for (fd in folds) {
+  dtr <- xgb.DMatrix(X[-fd, , drop = FALSE], label = y[-fd])
+  dva <- xgb.DMatrix(X[ fd, , drop = FALSE], label = y[ fd])
+  fit <- xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      eval_metric = "rmse",
+      eta = 0.05, max_depth = 5,
+      subsample = 0.7, colsample_bytree = 0.8
+    ),
+    data = dtr, nrounds = 1000, verbose = 0
+  )
+  pred_xgb[fd] <- predict(fit, dva)
+}
+fit_all <- xgb.train(
+  params = list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    eta = 0.05, max_depth = 5,
+    subsample = 0.7, colsample_bytree = 0.8
+  ),
+  data = xgb.DMatrix(X, label = y),
+  nrounds = 1000, verbose = 0
+)
+xgb_imp <- xgb.importance(model = fit_all)
+gene <- head(xgb_imp$Feature, topN)
+algo_res$XGB <- list(pred = pred_xgb, gene = gene)
+
+#### 2.2.6 LightGBM ---------------------------------------------
+pred_lgb <- numeric(n_trainval)
+for (fd in folds) {
+  dtr <- lgb.Dataset(data = X[-fd, , drop = FALSE], label = y[-fd])
+  fit <- lgb.train(
+    params = list(
+      objective = "regression",
+      metric = "rmse",
+      num_leaves = 31,
+      learning_rate = 0.05,
+      feature_fraction = 0.8,
+      bagging_fraction = 0.8,
+      bagging_freq = 1
+    ),
+    data = dtr, nrounds = 2000, verbose = -1
+  )
+  pred_lgb[fd] <- predict(fit, X[fd, , drop = FALSE])
+}
+fit_all <- lgb.train(
+  params = list(
+    objective = "regression",
+    metric = "rmse",
+    num_leaves = 31,
+    learning_rate = 0.05,
+    feature_fraction = 0.8,
+    bagging_fraction = 0.8,
+    bagging_freq = 1
+  ),
+  data = lgb.Dataset(X, label = y),
+  nrounds = 2000, verbose = -1
+)
+lgb_imp <- lgb.importance(fit_all)
+gene <- head(lgb_imp$Feature, topN)
+algo_res$LGB <- list(pred = pred_lgb, gene = gene)
+
+#### 2.2.7 GBM --------------------------------------------------
+pred_gbm <- numeric(n_trainval)
+for (fd in folds) {
+  Xtr <- X[-fd, , drop = FALSE]; ytr <- y[-fd]
+  Xte <- X[ fd, , drop = FALSE]
+  ntr <- nrow(Xtr)
+  bag <- 0.8
+  nmin <- max(1, floor((ntr * bag - 2) / 2))
+  gbm_fit <- gbm.fit(
+    x = Xtr, y = ytr,
+    distribution = "gaussian",
+    n.trees = 4000,
+    interaction.depth = 3,
+    shrinkage = 0.01,
+    bag.fraction = bag,
+    n.minobsinnode = nmin,
+    train.fraction = 1.0,
+    verbose = FALSE
+  )
+  best_iter <- gbm.perf(gbm_fit, method = "OOB", plot.it = FALSE)
+  pred_gbm[fd] <- predict(gbm_fit, newdata = Xte, n.trees = best_iter)
+}
+gbm_all <- gbm.fit(
+  x = X, y = y,
+  distribution = "gaussian",
+  n.trees = 4000,
+  interaction.depth = 3,
+  shrinkage = 0.01,
+  bag.fraction = 0.8,
+  n.minobsinnode = max(1, floor((nrow(X) * 0.8 - 2) / 2)),
+  train.fraction = 1.0,
+  verbose = FALSE
+)
+best_iter <- gbm.perf(gbm_all, method = "OOB", plot.it = FALSE)
+gbm_imp <- summary(gbm_all, n.trees = best_iter, plot.it = FALSE)
+gene <- head(gbm_imp$var, topN)
+algo_res$GBM <- list(pred = pred_gbm, gene = gene)
+
+#### 2.2.8 KNN 回归（置换重要性） -----------------------------
+pred_knn <- numeric(n_trainval)
+for (fd in folds) {
+  Xtr <- X[-fd, , drop = FALSE]; ytr <- y[-fd]
+  Xte <- X[ fd, , drop = FALSE]
+  sc <- scale_by_train(Xtr, Xte)
+  Xtr_s <- sc$Xtr; Xte_s <- sc$Xte
+  ntr <- nrow(Xtr_s)
+  k   <- max(5, min(25, floor(sqrt(ntr))))
+  pred_knn[fd] <- FNN::knn.reg(train = Xtr_s, test = Xte_s,
+                               y = ytr, k = k)$pred
+}
+## 在全部 train+val 上计算 KNN 重要性
+mu_all <- colMeans(X)
+sd_all <- apply(X, 2, sd)
+sd_all[sd_all == 0 | is.na(sd_all)] <- 1
+X_s_all <- sweep(sweep(X, 2, mu_all, "-"), 2, sd_all, "/")
+n_all <- nrow(X_s_all)
+k_all <- max(5, min(25, floor(sqrt(n_all))))
+set.seed(42)
+base_pred <- FNN::knn.reg(train = X_s_all, test = X_s_all,
+                          y = y, k = k_all)$pred
+base_mse  <- mean((y - base_pred)^2)
+imp_knn <- numeric(ncol(X_s_all))
+for (j in seq_len(ncol(X_s_all))) {
+  X_perm <- X_s_all
+  X_perm[, j] <- sample(X_perm[, j])
+  pred_perm <- FNN::knn.reg(train = X_s_all, test = X_perm,
+                            y = y, k = k_all)$pred
+  imp_knn[j] <- mean((y - pred_perm)^2) - base_mse
+}
+names(imp_knn) <- colnames(X)
+gene_knn <- names(sort(imp_knn, decreasing = TRUE))[seq_len(
+  min(topN, length(imp_knn))
+)]
+algo_res$KNN <- list(pred = pred_knn, gene = gene_knn)
+
+#### 2.2.9 SVM ε-回归 (RBF) ------------------------------------
+pred_svm <- numeric(n_trainval)
+for (fd in folds) {
+  Xtr <- X[-fd, , drop = FALSE]; ytr <- y[-fd]
+  Xte <- X[ fd, , drop = FALSE]
+  sc <- scale_by_train(Xtr, Xte)
+  Xtr_s <- sc$Xtr; Xte_s <- sc$Xte
+  
+  svm_fit <- e1071::svm(
+    x = Xtr_s, y = ytr,
+    type   = "eps-regression",
+    kernel = "radial",
+    cost   = 5,
+    gamma  = 1 / ncol(Xtr_s),
+    epsilon= 0.1,
+    scale  = FALSE
+  )
+  pred_svm[fd] <- predict(svm_fit, newdata = Xte_s)
+}
+## SVM 置换重要性（train+val）
+mu_all <- colMeans(X)
+sd_all <- apply(X, 2, sd)
+sd_all[sd_all == 0 | is.na(sd_all)] <- 1
+X_s_all <- sweep(sweep(X, 2, mu_all, "-"), 2, sd_all, "/")
+svm_all <- e1071::svm(
+  x = X_s_all, y = y,
+  type   = "eps-regression",
+  kernel = "radial",
+  cost   = 5,
+  gamma  = 1 / ncol(X_s_all),
+  epsilon= 0.1,
+  scale  = FALSE
+)
+base_pred <- predict(svm_all, newdata = X_s_all)
+base_mse  <- mean((y - base_pred)^2)
+imp_svm <- numeric(ncol(X_s_all))
+set.seed(42)
+for (j in seq_len(ncol(X_s_all))) {
+  X_perm <- X_s_all
+  X_perm[, j] <- sample(X_perm[, j])
+  pred_perm <- predict(svm_all, newdata = X_perm)
+  imp_svm[j] <- mean((y - pred_perm)^2) - base_mse
+}
+names(imp_svm) <- colnames(X)
+gene_svm <- names(sort(imp_svm, decreasing = TRUE))[seq_len(
+  min(topN, length(imp_svm))
+)]
+algo_res$SVM <- list(pred = pred_svm, gene = gene_svm)
+
+#### 2.2.10 决策树 (rpart，高维稳健版) -------------------------
+pred_dt <- numeric(n_trainval)
+max_features_dt <- 1000
+for (fd in folds) {
+  Xtr <- X[-fd, , drop = FALSE]; ytr <- y[-fd]
+  Xte <- X[ fd, , drop = FALSE]
+  sp_fold <- suppressWarnings(apply(
+    Xtr, 2, function(col) abs(cor(col, ytr, method = "spearman"))
+  ))
+  sp_fold[is.na(sp_fold)] <- 0
+  keep_names_fold <- names(sort(sp_fold, decreasing = TRUE))[seq_len(
+    min(max_features_dt, sum(sp_fold > 0))
+  )]
+  if (length(keep_names_fold) < 2L) {
+    pred_dt[fd] <- mean(ytr)
+    next
+  }
+  Xtr_sub <- Xtr[, keep_names_fold, drop = FALSE]
+  Xte_sub <- Xte[, keep_names_fold, drop = FALSE]
+  dt_fit <- rpart::rpart(
+    formula = ytr ~ .,
+    data = data.frame(ytr = ytr, Xtr_sub),
+    method = "anova",
+    control = rpart::rpart.control(
+      xval        = 0,
+      minsplit    = max(10, floor(0.1 * nrow(Xtr_sub))),
+      cp          = 0.002,
+      maxdepth    = 8,
+      maxcompete  = 0,
+      maxsurrogate = 0
+    ),
+    model = FALSE, x = FALSE, y = FALSE
+  )
+  pred_dt[fd] <- predict(dt_fit, newdata = as.data.frame(Xte_sub))
+}
+## 全 train+val 上的特征重要性
+sp_all <- suppressWarnings(apply(
+  X, 2, function(col) abs(cor(col, y, method = "spearman"))
+))
+sp_all[is.na(sp_all)] <- 0
+keep_names_all <- names(sort(sp_all, decreasing = TRUE))[seq_len(
+  min(max_features_dt, sum(sp_all > 0))
+)]
+if (length(keep_names_all) < 2L) {
+  gene_dt <- names(sort(sp_all, decreasing = TRUE))[seq_len(
+    min(topN, length(sp_all))
+  )]
+} else {
+  X_sub_all <- X[, keep_names_all, drop = FALSE]
+  dt_all <- rpart::rpart(
+    formula = y ~ .,
+    data = data.frame(y = y, X_sub_all),
+    method = "anova",
+    control = rpart::rpart.control(
+      xval        = 0,
+      minsplit    = max(10, floor(0.1 * nrow(X_sub_all))),
+      cp          = 0.002,
+      maxdepth    = 8,
+      maxcompete  = 0,
+      maxsurrogate = 0
+    ),
+    model = FALSE, x = FALSE, y = FALSE
+  )
+  dt_imp <- dt_all$variable.importance
+  if (!is.null(dt_imp) && length(dt_imp) > 0) {
+    gene_dt <- names(sort(dt_imp, decreasing = TRUE))[seq_len(
+      min(topN, length(dt_imp))
+    )]
+  } else {
+    gene_dt <- names(sort(sp_all, decreasing = TRUE))[seq_len(
+      min(topN, length(sp_all))
+    )]
+  }
+}
+algo_res$DecisionTree <- list(pred = pred_dt, gene = gene_dt)
+
+#### 2.2.11 朴素贝叶斯（y 分箱 → 分类 → 连续预测） ----------
+B <- 5
+breaks_nb <- quantile(y, probs = seq(0, 1, length.out = B + 1), na.rm = TRUE)
+breaks_nb[1] <- breaks_nb[1] - 1e-8
+mids_nb <- sapply(1:B, function(i) mean(breaks_nb[i:(i + 1)]))
+pred_nb <- numeric(n_trainval)
+
+for (fd in folds) {
+  Xtr <- X[-fd, , drop = FALSE]; ytr <- y[-fd]
+  Xte <- X[ fd, , drop = FALSE]
+  ybin_tr <- cut(ytr, breaks = breaks_nb, include.lowest = TRUE, right = TRUE)
+  nb_fit  <- e1071::naiveBayes(x = Xtr, y = ybin_tr)
+  post <- predict(nb_fit, newdata = Xte, type = "raw")
+  pred_nb[fd] <- as.numeric(post %*% mids_nb)
+}
+## 全 train+val 的 NB 重要性（置换）
+pre_m <- 3000
+sp_nb <- suppressWarnings(apply(
+  X, 2, function(col) abs(cor(col, y, method = "spearman"))
+))
+sp_nb[is.na(sp_nb)] <- 0
+keep_nb <- names(sort(sp_nb, decreasing = TRUE))[seq_len(
+  min(pre_m, sum(sp_nb > 0))
+)]
+X_nb <- X[, keep_nb, drop = FALSE]
+ybin_all <- cut(y, breaks = breaks_nb, include.lowest = TRUE, right = TRUE)
+nb_all   <- e1071::naiveBayes(x = X_nb, y = ybin_all)
+post_base <- predict(nb_all, newdata = X_nb, type = "raw")
+base_pred <- as.numeric(post_base %*% mids_nb)
+base_mse  <- mean((y - base_pred)^2)
+imp_nb <- numeric(ncol(X_nb))
+set.seed(42)
+for (j in seq_len(ncol(X_nb))) {
+  X_perm <- X_nb
+  X_perm[, j] <- sample(X_perm[, j])
+  post_perm <- predict(nb_all, newdata = X_perm, type = "raw")
+  pred_perm <- as.numeric(post_perm %*% mids_nb)
+  imp_nb[j]  <- mean((y - pred_perm)^2) - base_mse
+}
+names(imp_nb) <- colnames(X_nb)
+gene_nb <- names(sort(imp_nb, decreasing = TRUE))[seq_len(
+  min(topN, length(imp_nb))
+)]
+algo_res$NaiveBayes <- list(pred = pred_nb, gene = gene_nb)
+
+############################################################
+## 2.3 多模型性能表 (RMSE / R2 / MAE, 基于 train+val 5-fold CV)
+############################################################
+
+metrics <- function(pred, name) {
+  data.frame(
+    Algorithm = name,
+    RMSE = sqrt(mean((y - pred)^2)),
+    R2   = cor(y, pred, use = "complete.obs")^2,
+    MAE  = mean(abs(y - pred))
+  )
+}
+eval_df <- purrr::map_df(names(algo_res),
+                         ~ metrics(algo_res[[.x]]$pred, .x))
+write.csv(eval_df,
+          file.path(outdir, "algorithm_comparison_trainval.csv"),
+          row.names = FALSE)
+print(eval_df)
+
+## === 可视化：11 模型性能对比（R² / RMSE） =====================
+p_r2 <- ggplot(eval_df,
+               aes(x = reorder(Algorithm, R2), y = R2)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  labs(title = "11 算法在 train+val 上的 R²",
+       x = "算法", y = "R²")
+ggsave(file.path(outdir, "ModelPerformance_R2_trainval.png"),
+       p_r2, width = 6, height = 4, dpi = 300)
+
+p_rmse <- ggplot(eval_df,
+                 aes(x = reorder(Algorithm, -RMSE), y = RMSE)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  labs(title = "11 算法在 train+val 上的 RMSE",
+       x = "算法", y = "RMSE")
+ggsave(file.path(outdir, "ModelPerformance_RMSE_trainval.png"),
+       p_rmse, width = 6, height = 4, dpi = 300)
+
+############################################################
+## 2.4 回归–ROC（tolerance curve） + AUCτ（基于 train+val）
+############################################################
+
+err_list <- lapply(names(algo_res), function(m) {
+  tibble(Model = m, Error = abs(y - algo_res[[m]]$pred))
+})
+err_df <- bind_rows(err_list)
+tau_max <- quantile(err_df$Error, 0.95, na.rm = TRUE)
+tau_grid <- seq(0, as.numeric(tau_max), length.out = 100)
+
+tolerance_curve <- err_df %>%
+  group_by(Model) %>%
+  do({
+    e <- .$Error
+    tibble(tau = tau_grid,
+           within = sapply(tau_grid, function(t) mean(e <= t, na.rm = TRUE)))
+  }) %>%
+  ungroup()
+
+auc_tab <- tolerance_curve %>%
+  group_by(Model) %>%
+  summarise(AUC_tau = trapz(tau, within), .groups = "drop") %>%
+  arrange(desc(AUC_tau))
+
+write_csv(auc_tab, file.path(outdir, "Regression_ROC_AUCtau_trainval.csv"))
+print(auc_tab)
+
+## ======= 基于 tolerance_curve + auc_tab 的可视化 =======
+
+# 1) 给每个模型加上 "Model (AUCτ=0.812)" 这样的标签，方便在图例里显示
+auc_tab_plot <- auc_tab %>%
+  mutate(
+    Model_label = paste0(
+      Model,
+      " (AUCτ=", sprintf("%.3f", AUC_tau), ")"
+    )
+  )
+
+# 2) 把 AUCτ 信息 merge 回 tolerance_curve，用新的 label 做颜色映射
+tolerance_plot_df <- tolerance_curve %>%
+  left_join(auc_tab_plot %>% select(Model, Model_label),
+            by = "Model") %>%
+  mutate(
+    Model_label = factor(
+      Model_label,
+      levels = auc_tab_plot$Model_label[order(auc_tab_plot$AUC_tau,
+                                              decreasing = TRUE)]
+    )
+  )
+
+# 3) 画出“回归-ROC 曲线”（所有模型一张图）
+p_reg_roc <- ggplot(tolerance_plot_df,
+                    aes(x = tau, y = within, color = Model_label)) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "Tolerance τ (|prediction error| ≤ τ)",
+    y = "Proportion within tolerance",
+    color = "Model (AUCτ)",
+    title = "Regression-ROC (Tolerance Curve) on train+val"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.key.height = unit(0.6, "cm")
+  )
+
+ggsave(
+  filename = file.path(outdir, "Regression_ROC_AUCtau_ClusterPlot_trainval.pdf"),
+  plot = p_reg_roc,
+  width = 8, height = 6
+)
+
+## === 可视化：回归-ROC 容忍曲线（所有模型的 tolerance curve） ===
+p_tol <- ggplot(tolerance_curve,
+                aes(x = tau, y = within, color = Model)) +
+  geom_line(size = 1) +
+  theme_bw(base_size = 12) +
+  labs(title = "Regression-ROC 容忍曲线 (train+val)",
+       x = expression(tau),
+       y = "P(|误差| ≤ τ )")
+ggsave(file.path(outdir, "Regression_ROC_toleranceCurves_trainval.png"),
+       p_tol, width = 7, height = 5, dpi = 300)
+
+############################################################
+## 3. 特征重要度整合 + 共识基因（基于 TopK 模型）
+############################################################
+
+## 所有模型 TopN 基因列表
+gene_lists_all <- purrr::map(names(algo_res),
+                             ~ algo_res[[.x]]$gene) |>
+  rlang::set_names(names(algo_res))
+
+## 所有模型 TopN 的并集（PC1 轨迹要用）
+union_genes_all <- reduce(gene_lists_all, union)
+
+## 3.1 在 AUC_tau 基础上自动选出表现最好的 TopK 模型
+topK_models <- 3   # 想要用几种模型参与特征整合，这里改数字即可
+
+best_models <- auc_tab %>%
+  arrange(desc(AUC_tau)) %>%
+  slice_head(n = topK_models) %>%
+  pull(Model)
+
+cat("用于特征重要度整合的 Top", topK_models, "模型：\n")
+print(best_models)
+
+## 3.2 TopK 模型的基因集合 & 共识基因 ---------------------------
+gene_lists <- purrr::map(best_models, ~ algo_res[[.x]]$gene) |>
+  rlang::set_names(best_models)
+
+## 并集基因池
+union_genes <- reduce(gene_lists, union)
+write.csv(data.frame(Gene = union_genes),
+          file = file.path(outdir,
+                           sprintf("union_topN_genes_Top%dModels.csv",
+                                   length(best_models))),
+          row.names = FALSE)
+
+## 关键基因长表 / 频次 / 共识
+key_genes_long <- purrr::map_df(best_models, function(m) {
+  g <- unique(algo_res[[m]]$gene)
+  tibble(Method = m, Gene = g, Rank = seq_along(g))
+})
+
+key_genes_freq <- key_genes_long |>
+  count(Gene, name = "MethodsCount") |>
+  arrange(desc(MethodsCount))
+
+consensus_k <- 2  # 例如：至少被 ≥2 个 TopK 模型选中
+consensus_genes <- key_genes_freq |>
+  filter(MethodsCount >= consensus_k)
+
+write_csv(key_genes_long,
+          file.path(outdir,
+                    sprintf("key_genes_by_method_long_Top%dModels.csv",
+                            length(best_models))))
+write_csv(key_genes_freq,
+          file.path(outdir,
+                    sprintf("key_genes_frequency_Top%dModels.csv",
+                            length(best_models))))
+write_csv(consensus_genes,
+          file.path(outdir,
+                    sprintf("key_genes_consensus_k%d_Top%dModels.csv",
+                            consensus_k, length(best_models))))
+
+## === 可视化：TopK 模型 Top 基因 UpSet 图 ======================
+if (length(gene_lists) >= 2) {
+  try({
+    upset_input <- UpSetR::fromList(gene_lists)
+    pdf(file.path(outdir,
+                  sprintf("UpSet_TopGenes_Top%dModels.pdf",
+                          length(best_models))),
+        width = 8, height = 5)
+    UpSetR::upset(as.data.frame(upset_input),
+                  nsets = length(gene_lists),
+                  nintersects = 30,
+                  order.by = "freq")
+    dev.off()
+  }, silent = TRUE)
+}
+
+############################################################
+## 4. PC1 转录组时间轨迹 + 各模型拟合轨迹（基于 train+val）
+############################################################
+
+if (length(union_genes_all) >= 2) {
+  common <- intersect(colnames(X), union_genes_all)
+  if (length(common) >= 2) {
+    pc1 <- prcomp(X[, common, drop = FALSE],
+                  center = TRUE, scale. = TRUE)$x[, 1]
+    traj_ref <- tibble(day = y, score = pc1) |>
+      group_by(day) |>
+      summarise(score = mean(score), .groups = "drop")
+    
+    method_levels <- names(algo_res)
+    
+    pred_long <- purrr::map_df(method_levels, ~
+                                 tibble(day = y,
+                                        pred_day = algo_res[[.x]]$pred,
+                                        Strategy = .x)) |>
+      mutate(score = approx(traj_ref$day, traj_ref$score,
+                            xout = pred_day, rule = 2)$y)
+    
+    pred_long$Strategy <- factor(pred_long$Strategy,
+                                 levels = method_levels)
+    
+    cols_methods <- setNames(
+      rainbow(length(method_levels), alpha = 0.85),
+      method_levels
+    )
+    cols_all <- c("Real" = "#000000", cols_methods)
+    
+    traj_plot <- bind_rows(
+      mutate(traj_ref,
+             Strategy = factor("Real", levels = c("Real", method_levels))),
+      pred_long
+    )
+    
+    pdf(file.path(outdir, "ElevenAlgorithms_Trajectory_Curve_trainval.pdf"),
+        width = 8, height = 5)
+    print(
+      ggplot(traj_plot, aes(day, score, color = Strategy)) +
+        stat_smooth(se = TRUE, method = "loess",
+                    span = 0.3, linewidth = 1, na.rm = TRUE) +
+        scale_color_manual(
+          values = cols_all,
+          breaks = c("Real", method_levels),
+          drop   = FALSE
+        ) +
+        labs(x = "Day", y = "PC1 (union TopN genes of ALL models)") +
+        theme_bw(base_size = 14)
+    )
+    dev.off()
+  } else {
+    message("所有模型并集基因与 X 的列名交集 < 2，跳过 PC1 轨迹图。")
+  }
+}
+cat(sprintf("Union TopN genes (all models) : %4d\n",
+            length(union_genes_all)))
+cat(sprintf("交集（11 算法）   : %4d\n",
+            length(reduce(gene_lists_all, intersect))))
+
+############################################################
+## 5. 基于最佳线性模型的时间折 LOPO 验证 + 排名稳定性
+##    （在 train+val 上进行）
+############################################################
+
+## 5.1 根据 AUCτ 选择“全局最优”与“线性最优”模型 ------------
+candidate_models <- c("LASSO", "Elastic", "Ridge",
+                      "RF", "XGB", "LGB", "GBM", "SVM")
+lin_models <- c("LASSO", "Elastic", "Ridge")
+
+best_model_all <- auc_tab %>%
+  dplyr::filter(Model %in% candidate_models) %>%
+  dplyr::arrange(dplyr::desc(AUC_tau)) %>%
+  dplyr::slice_head(n = 1) %>%
+  dplyr::pull(Model)
+
+best_model_name <- auc_tab %>%
+  dplyr::filter(Model %in% lin_models) %>%
+  dplyr::arrange(dplyr::desc(AUC_tau)) %>%
+  dplyr::slice_head(n = 1) %>%
+  dplyr::pull(Model)
+
+cat("根据 AUCτ 在候选模型中选择的全局最优模型 (train+val)：",
+    best_model_all, "\n")
+
+best_cv_row <- eval_df %>%
+  filter(Algorithm == best_model_name)
+
+rmse_cv <- best_cv_row$RMSE[1]
+r2_cv   <- best_cv_row$R2[1]
+
+cat("该线性模型的 5-fold CV 指标 (train+val)：RMSE =",
+    round(rmse_cv, 3), ", R2 =", round(r2_cv, 3), "\n")
+
+alpha_best <- switch(
+  best_model_name,
+  "LASSO"   = 1,
+  "Elastic" = 0.5,
+  "Ridge"   = 0,
+  stop("best_model_name 不是 LASSO / Elastic / Ridge 之一。")
+)
+
+## 5.2 辅助函数：拟合 glmnet 并提取系数 -------------------------
+fit_glmnet_and_coef <- function(X_train, y_train, alpha, nfolds = 5) {
+  fit_cv <- cv.glmnet(
+    x      = X_train,
+    y      = y_train,
+    family = "gaussian",
+    alpha  = alpha,
+    nfolds = nfolds
+  )
+  cf <- as.matrix(coef(fit_cv, s = "lambda.min"))
+  gene <- setdiff(rownames(cf), "(Intercept)")
+  coef_df <- tibble::tibble(
+    Gene = gene,
+    Coef = as.numeric(cf[gene, , drop = FALSE])
+  )
+  list(fit_cv = fit_cv, coef_df = coef_df)
+}
+
+## 5.3 按 day 做 LOPO（train+val） -----------------------------
+days_u <- sort(unique(meta$day))
+lopo_pred_vec <- rep(NA_real_, length(y))
+lopo_foldid   <- rep(NA_integer_, length(y))
+coef_folds    <- list()
+
+for (d in days_u) {
+  cat("LOPO 折 (train+val)：留出 day =", d, "作为测试集 ...\n")
+  test_idx  <- which(meta$day == d)
+  train_idx <- setdiff(seq_along(y), test_idx)
+  
+  X_train <- X[train_idx, , drop = FALSE]
+  y_train <- y[train_idx]
+  X_test_lopo  <- X[test_idx,  , drop = FALSE]
+  
+  fit_res <- fit_glmnet_and_coef(X_train, y_train,
+                                 alpha = alpha_best, nfolds = 5)
+  fit_cv  <- fit_res$fit_cv
+  coef_df <- fit_res$coef_df %>%
+    mutate(FoldDay = d)
+  coef_folds[[as.character(d)]] <- coef_df
+  
+  lopo_pred_vec[test_idx] <- as.numeric(
+    predict(fit_cv, newx = X_test_lopo, s = "lambda.min")
+  )
+  lopo_foldid[test_idx] <- d
+}
+
+## 5.4 LOPO 性能指标 + CV 对比 ------------------------------
+rmse_lopo <- sqrt(mean((y - lopo_pred_vec)^2, na.rm = TRUE))
+r2_lopo   <- cor(y, lopo_pred_vec, use = "complete.obs")^2
+
+ratio_rmse <- rmse_lopo / rmse_cv
+delta_r2   <- r2_cv - r2_lopo
+
+lopo_summary <- tibble::tibble(
+  Model      = best_model_name,
+  CV_RMSE    = rmse_cv,
+  CV_R2      = r2_cv,
+  LOPO_RMSE  = rmse_lopo,
+  LOPO_R2    = r2_lopo,
+  Ratio_RMSE = ratio_rmse,
+  Delta_R2   = delta_r2
+)
+
+print(lopo_summary)
+write_csv(lopo_summary,
+          file.path(outdir, "LOPO_bestLinearModel_summary_trainval.csv"))
+
+## 5.5 基因系数排名稳定性（LOPO vs 全 train+val） ------------
+
+coef_folds_long <- bind_rows(coef_folds) %>%
+  group_by(FoldDay) %>%
+  mutate(
+    AbsCoef   = abs(Coef),
+    Rank_fold = rank(-AbsCoef, ties.method = "average")
+  ) %>%
+  ungroup()
+
+fit_full <- cv.glmnet(
+  x      = X,
+  y      = y,
+  family = "gaussian",
+  alpha  = alpha_best,
+  nfolds = 5
+)
+cf_full   <- as.matrix(coef(fit_full, s = "lambda.min"))
+gene_full <- setdiff(rownames(cf_full), "(Intercept)")
+
+coef_full_df <- tibble::tibble(
+  Gene = gene_full,
+  Coef = as.numeric(cf_full[gene_full, , drop = FALSE])
+) %>%
+  mutate(
+    AbsCoef   = abs(Coef),
+    Rank_full = rank(-AbsCoef, ties.method = "average")
+  )
+
+rank_comp <- coef_folds_long %>%
+  inner_join(
+    coef_full_df %>% select(Gene, Rank_full),
+    by = "Gene"
+  )
+
+stab_by_fold <- rank_comp %>%
+  group_by(FoldDay) %>%
+  summarise(
+    n_genes = n(),
+    rho_s   = cor(Rank_fold, Rank_full, method = "spearman"),
+    .groups = "drop"
+  ) %>%
+  arrange(FoldDay)
+
+print(stab_by_fold)
+write_csv(
+  stab_by_fold,
+  file.path(outdir, "LOPO_bestLinearModel_rankStability_byFold_trainval.csv")
+)
+
+mean_rho <- mean(stab_by_fold$rho_s, na.rm = TRUE)
+cat("平均折间排名稳定性（与全 train+val 排名的 Spearman 相关）：",
+    round(mean_rho, 3), "\n")
+
+## === 可视化：LOPO 折间排名稳定性（按 day 的 Spearman ρ 柱状图） ==
+p_lopo <- ggplot(stab_by_fold,
+                 aes(x = factor(FoldDay), y = rho_s)) +
+  geom_col() +
+  theme_bw(base_size = 12) +
+  labs(title = paste0("LOPO 排名稳定性（模型：", best_model_name, "）"),
+       x = "留出的 day",
+       y = "Spearman ρ（Fold vs 全数据）")
+ggsave(file.path(outdir, "LOPO_rankStability_byFold_trainval.png"),
+       p_lopo, width = 6, height = 4, dpi = 300)
+
+############################################################
+## 5B. 通用：fit_model_best（用于 LOPO & 外部测试评估）
+############################################################
+
+fit_model_best <- function(model_name, X_train, y_train, X_test) {
+  if (model_name %in% c("LASSO", "Elastic", "Ridge")) {
+    alpha_val <- switch(
+      model_name,
+      "LASSO"   = 1,
+      "Elastic" = 0.5,
+      "Ridge"   = 0
+    )
+    fit_cv <- cv.glmnet(
+      x      = X_train,
+      y      = y_train,
+      family = "gaussian",
+      alpha  = alpha_val,
+      nfolds = 5
+    )
+    pred <- as.numeric(
+      predict(fit_cv, newx = X_test, s = "lambda.min")
+    )
+    return(list(pred = pred))
+    
+  } else if (model_name == "RF") {
+    ntr <- nrow(X_train)
+    fit <- randomForest(
+      x = X_train, y = y_train,
+      ntree    = 1500,
+      nodesize = max(3, floor(ntr * 0.05)),
+      maxnodes = 64,
+      importance = FALSE
+    )
+    pred <- predict(fit, newdata = X_test)
+    return(list(pred = pred))
+    
+  } else if (model_name == "XGB") {
+    dtr <- xgb.DMatrix(X_train, label = y_train)
+    dte <- xgb.DMatrix(X_test)
+    fit <- xgb.train(
+      params = list(
+        objective = "reg:squarederror",
+        eval_metric = "rmse",
+        eta = 0.05, max_depth = 5,
+        subsample = 0.7, colsample_bytree = 0.8
+      ),
+      data = dtr, nrounds = 1000, verbose = 0
+    )
+    pred <- predict(fit, dte)
+    return(list(pred = pred))
+    
+  } else if (model_name == "LGB") {
+    dtr <- lgb.Dataset(data = X_train, label = y_train)
+    fit <- lgb.train(
+      params = list(
+        objective = "regression",
+        metric = "rmse",
+        num_leaves = 31,
+        learning_rate = 0.05,
+        feature_fraction = 0.8,
+        bagging_fraction = 0.8,
+        bagging_freq = 1
+      ),
+      data = dtr, nrounds = 2000, verbose = -1
+    )
+    pred <- predict(fit, X_test)
+    return(list(pred = pred))
+    
+  } else if (model_name == "GBM") {
+    ntr <- nrow(X_train)
+    bag <- 0.8
+    nmin <- max(1, floor((ntr * bag - 2) / 2))
+    gbm_fit <- gbm.fit(
+      x = X_train, y = y_train,
+      distribution = "gaussian",
+      n.trees = 4000,
+      interaction.depth = 3,
+      shrinkage = 0.01,
+      bag.fraction = bag,
+      n.minobsinnode = nmin,
+      train.fraction = 1.0,
+      verbose = FALSE
+    )
+    best_iter <- gbm.perf(gbm_fit, method = "OOB", plot.it = FALSE)
+    pred <- predict(gbm_fit, newdata = X_test, n.trees = best_iter)
+    return(list(pred = pred))
+    
+  } else if (model_name == "SVM") {
+    sc <- scale_by_train(X_train, X_test)
+    Xtr_s <- sc$Xtr; Xte_s <- sc$Xte
+    svm_fit <- e1071::svm(
+      x = Xtr_s, y = y_train,
+      type   = "eps-regression",
+      kernel = "radial",
+      cost   = 5,
+      gamma  = 1 / ncol(Xtr_s),
+      epsilon= 0.1,
+      scale  = FALSE
+    )
+    pred <- predict(svm_fit, newdata = Xte_s)
+    return(list(pred = pred))
+    
+  } else {
+    stop("不支持的模型名称：", model_name)
+  }
+}
+
+############################################################
+## 5C. 外部独立测试集评估（基于全局最优模型 best_model_all）
+############################################################
+
+if (!is.null(best_model_all) && length(idx_test) > 0) {
+  cat("基于全局最优模型", best_model_all,
+      "在独立测试集上评估泛化性能...\n")
+  
+  X_train_outer <- X_all[idx_trainval, , drop = FALSE]
+  y_train_outer <- y_all[idx_trainval]
+  X_test_outer  <- X_test
+  y_test_outer  <- y_test
+  
+  fit_res_outer <- fit_model_best(
+    model_name = best_model_all,
+    X_train    = X_train_outer,
+    y_train    = y_train_outer,
+    X_test     = X_test_outer
+  )
+  pred_test_outer <- as.numeric(fit_res_outer$pred)
+  
+  rmse_test_outer <- sqrt(mean((y_test_outer - pred_test_outer)^2))
+  r2_test_outer   <- cor(y_test_outer, pred_test_outer,
+                         use = "complete.obs")^2
+  mae_test_outer  <- mean(abs(y_test_outer - pred_test_outer))
+  
+  test_perf <- data.frame(
+    Model    = best_model_all,
+    Test_RMSE = rmse_test_outer,
+    Test_R2   = r2_test_outer,
+    Test_MAE  = mae_test_outer
+  )
+  write.csv(test_perf,
+            file.path(outdir,
+                      "BestOverallModel_TestSet_Performance.csv"),
+            row.names = FALSE)
+  print(test_perf)
+} else {
+  cat("无测试集或未找到 best_model_all，跳过独立测试评估。\n")
+}
+
+
+## 5D. Nested CV 超参调优：外层 LOPO + 内层 5-CV（仅 Top3 模型）
+############################################################
+
+registerDoParallel(max(1, parallel::detectCores() - 2))
+
+## 仅对最终 Top3 模型做 nested CV（且要在 param_grid 里有定义）
+nested_models <- auc_tab %>%
+  arrange(desc(AUC_tau)) %>%
+  pull(Model) %>%
+  intersect(names(param_grid)) %>%
+  head(3)
+
+cat("进行 Nested CV 的模型：", paste(nested_models, collapse = ", "), "\n")
+
+nested_res <- list()
+
+for (m in nested_models) {
+  cat("Nested CV for", m, "...\n")
+  outer_pred   <- numeric(length(y))   # 外层 LOPO 预测
+  outer_params <- list()               # 记录每个 day 选中的最优参数
+  
+  ## 该模型对应的参数网格
+  par_df <- expand.grid(param_grid[[m]], stringsAsFactors = FALSE)
+  if (nrow(par_df) == 0L) {
+    stop("param_grid[['", m, "']] 为空，请检查 param_grid 定义。")
+  }
+  
+  for (d in sort(unique(meta$day))) {
+    test_idx  <- which(meta$day == d)
+    train_idx <- setdiff(seq_along(y), test_idx)
+    X_train_outer <- X[train_idx, , drop = FALSE]
+    y_train_outer <- y[train_idx]
+    X_test_outer  <- X[test_idx, , drop = FALSE]
+    
+    ## 内层 5-CV
+    inner_folds  <- createFolds(y_train_outer, k = 5, returnTrain = FALSE)
+    inner_mse    <- numeric(nrow(par_df))
+    
+    for (i in seq_len(nrow(par_df))) {
+      inner_pred <- numeric(length(y_train_outer))
+      
+      for (fd in inner_folds) {
+        X_tr <- X_train_outer[-fd, , drop = FALSE]
+        y_tr <- y_train_outer[-fd]
+        X_va <- X_train_outer[ fd, , drop = FALSE]
+        
+        ## ---- 按模型拟合 ----
+        fit <- switch(
+          m,
+          
+          LASSO = {
+            lambda_ratio <- par_df$lambda_ratio[i]
+            cv.glmnet(
+              X_tr, y_tr, family = "gaussian",
+              alpha = 1,
+              nfolds = 5,
+              lambda.min.ratio = lambda_ratio
+            )
+          },
+          
+          Elastic = {
+            alpha_val <- as.numeric(par_df$alpha[i])
+            if (length(alpha_val) != 1L || is.na(alpha_val)) {
+              stop("Elastic 的 alpha 未正确取到，请检查 param_grid$Elastic。")
+            }
+            cv.glmnet(
+              X_tr, y_tr, family = "gaussian",
+              alpha = alpha_val,
+              nfolds = 5
+            )
+          },
+          
+          Ridge = {
+            lambda_ratio <- par_df$lambda_ratio[i]
+            cv.glmnet(
+              X_tr, y_tr, family = "gaussian",
+              alpha = 0,
+              nfolds = 5,
+              lambda.min.ratio = lambda_ratio
+            )
+          },
+          
+          XGB = {
+            xgb.train(
+              params = list(
+                objective = "reg:squarederror",
+                eval_metric = "rmse",
+                max_depth = par_df$max_depth[i],
+                eta       = par_df$eta[i]
+              ),
+              data    = xgb.DMatrix(X_tr, label = y_tr),
+              nrounds = 500, verbose = 0
+            )
+          },
+          
+          LGB = {
+            lgb.train(
+              params = list(
+                objective       = "regression",
+                metric          = "rmse",
+                num_leaves      = par_df$num_leaves[i],
+                learning_rate   = par_df$learning_rate[i]
+              ),
+              data    = lgb.Dataset(X_tr, label = y_tr),
+              nrounds = 1000, verbose = -1
+            )
+          },
+          
+          RF = {
+            randomForest(
+              x = X_tr, y = y_tr,
+              mtry     = par_df$mtry[i],
+              ntree    = 800,
+              nodesize = max(3, floor(nrow(X_tr) * 0.05)),
+              maxnodes = 64
+            )
+          },
+          
+          SVM = {
+            sc_in <- scale_by_train(X_tr, X_va)
+            e1071::svm(
+              x      = sc_in$Xtr,
+              y      = y_tr,
+              type   = "eps-regression",
+              kernel = "radial",
+              cost   = par_df$cost[i],
+              gamma  = 1 / ncol(X_tr),
+              scale  = FALSE
+            )
+          },
+          
+          stop("模型 ", m, " 在 switch 中没有实现。")
+        )
+        
+        ## ---- 预测验证集 ----
+        inner_pred[fd] <- switch(
+          m,
+          LASSO   = as.numeric(predict(fit, newx = X_va, s = "lambda.min")),
+          Elastic = as.numeric(predict(fit, newx = X_va, s = "lambda.min")),
+          Ridge   = as.numeric(predict(fit, newx = X_va, s = "lambda.min")),
+          XGB     = predict(fit, xgb.DMatrix(X_va)),
+          LGB     = predict(fit, X_va),
+          RF      = predict(fit, X_va),
+          SVM     = {
+            sc_in <- scale_by_train(X_tr, X_va)
+            predict(fit, sc_in$Xte)
+          }
+        )
+      } # end inner folds
+      
+      inner_mse[i] <- mean((y_train_outer - inner_pred)^2)
+    } # end param grid
+    
+    ## 选最优参数
+    best_i   <- which.min(inner_mse)
+    best_par <- par_df[best_i, , drop = FALSE]
+    outer_params[[as.character(d)]] <- best_par
+    
+    ## 在整个 outer-train 上用最优参数重训，并预测 outer-test
+    best_fit <- switch(
+      m,
+      LASSO = {
+        cv.glmnet(
+          X_train_outer, y_train_outer,
+          family = "gaussian",
+          alpha  = 1,
+          nfolds = 5,
+          lambda.min.ratio = best_par$lambda_ratio
+        )
+      },
+      Elastic = {
+        alpha_val <- as.numeric(best_par$alpha)
+        cv.glmnet(
+          X_train_outer, y_train_outer,
+          family = "gaussian",
+          alpha  = alpha_val,
+          nfolds = 5
+        )
+      },
+      Ridge = {
+        cv.glmnet(
+          X_train_outer, y_train_outer,
+          family = "gaussian",
+          alpha  = 0,
+          nfolds = 5,
+          lambda.min.ratio = best_par$lambda_ratio
+        )
+      },
+      XGB = {
+        xgb.train(
+          params = list(
+            objective = "reg:squarederror",
+            eval_metric = "rmse",
+            max_depth   = best_par$max_depth,
+            eta         = best_par$eta
+          ),
+          data    = xgb.DMatrix(X_train_outer, label = y_train_outer),
+          nrounds = 500, verbose = 0
+        )
+      },
+      LGB = {
+        lgb.train(
+          params = list(
+            objective     = "regression",
+            metric        = "rmse",
+            num_leaves    = best_par$num_leaves,
+            learning_rate = best_par$learning_rate
+          ),
+          data    = lgb.Dataset(X_train_outer, label = y_train_outer),
+          nrounds = 1000, verbose = -1
+        )
+      },
+      RF = {
+        randomForest(
+          x = X_train_outer, y = y_train_outer,
+          mtry     = best_par$mtry,
+          ntree    = 800,
+          nodesize = max(3, floor(nrow(X_train_outer) * 0.05)),
+          maxnodes = 64
+        )
+      },
+      SVM = {
+        sc_out <- scale_by_train(X_train_outer, X_test_outer)
+        e1071::svm(
+          x      = sc_out$Xtr,
+          y      = y_train_outer,
+          type   = "eps-regression",
+          kernel = "radial",
+          cost   = best_par$cost,
+          gamma  = 1 / ncol(X_train_outer),
+          scale  = FALSE
+        )
+      }
+    )
+    
+    outer_pred[test_idx] <- switch(
+      m,
+      LASSO   = as.numeric(predict(best_fit, newx = X_test_outer, s = "lambda.min")),
+      Elastic = as.numeric(predict(best_fit, newx = X_test_outer, s = "lambda.min")),
+      Ridge   = as.numeric(predict(best_fit, newx = X_test_outer, s = "lambda.min")),
+      XGB     = predict(best_fit, xgb.DMatrix(X_test_outer)),
+      LGB     = predict(best_fit, X_test_outer),
+      RF      = predict(best_fit, X_test_outer),
+      SVM     = {
+        sc_out <- scale_by_train(X_train_outer, X_test_outer)
+        predict(best_fit, sc_out$Xte)
+      }
+    )
+  } # end outer LOPO days
+  
+  nested_res[[m]] <- tibble(
+    Model  = m,
+    RMSE   = sqrt(mean((y - outer_pred)^2)),
+    R2     = cor(y, outer_pred)^2,
+    Params = list(outer_params)
+  )
+}
+
+stopImplicitCluster()
+
+## 汇总 nested CV 结果
+nested_cv_df <- bind_rows(nested_res)
+
+## 性能表（不含 list 列 Params），方便导出为 CSV
+nested_cv_perf <- nested_cv_df %>%
+  dplyr::select(-Params)
+
+write.csv(
+  nested_cv_perf,
+  file.path(outdir, "NestedCV_Top3Models_Performance.csv"),
+  row.names = FALSE
+)
+
+print(nested_cv_perf)
+
+############################################################
+## 6. 基于共识基因的表达矩阵导出（log2CPM，全样本）
+############################################################
+
+## 恢复 meta / X / y 为全样本，用于下游表达 & LSTM 或其它分析
+meta <- meta_all
+X    <- X_all
+y    <- y_all
+
+stopifnot(all(colnames(cpm_mat) == meta$sample))
+
+genes_union_in_mat <- intersect(union_genes, rownames(cpm_mat))
+expr_union_mat <- cpm_mat[genes_union_in_mat, , drop = FALSE]
+write.csv(expr_union_mat,
+          file = file.path(outdir,
+                           "Expression_union_TopN_genes_logCPM.csv"),
+          quote = FALSE)
+
+genes_consensus_in_mat <- intersect(consensus_genes$Gene,
+                                    rownames(cpm_mat))
+expr_consensus_mat <- cpm_mat[genes_consensus_in_mat, , drop = FALSE]
+write.csv(
+  expr_consensus_mat,
+  file = file.path(outdir,
+                   sprintf("Expression_consensus_k_ge%d_logCPM.csv",
+                           consensus_k)),
+  quote = FALSE
+)
+
+############################################################
+## 6B. 显式统计检验模块：
+##      基因表达与时间(day)的相关性 + 多重检验校正 + 富集分析
+############################################################
+
+message("开始显式统计检验：基因表达 ~ 时间(day) ...")
+
+# 1) 取用于检验的表达矩阵：logCPM，行=基因，列=样本
+expr_mat <- cpm_mat        # 这里 cpm_mat 已是过滤后基因的 logCPM
+day_vec  <- meta$day
+n_samp   <- length(day_vec)
+
+stopifnot(ncol(expr_mat) == n_samp)
+
+# 2) 对每个基因计算与 day 的 Spearman 相关系数
+rho_vec <- apply(expr_mat, 1, function(z) {
+  suppressWarnings(cor(z, day_vec, method = "spearman"))
+})
+
+# 3) 根据相关系数近似计算 p 值（t 分布近似，常见做法）
+df   <- n_samp - 2
+tval <- rho_vec * sqrt(df / (1 - rho_vec^2))
+pval <- 2 * pt(-abs(tval), df = df)
+
+# 有些 rho 可能是 NA（常数向量），对应 pval 设为 1
+pval[is.na(pval)] <- 1
+
+# 4) Benjamini-Hochberg FDR 校正
+fdr  <- p.adjust(pval, method = "BH")
+
+# 5) 汇总成结果表：每个基因的效应量 + 显著性
+time_assoc_df <- tibble::tibble(
+  Gene = rownames(expr_mat),
+  Rho  = as.numeric(rho_vec),
+  Pval = as.numeric(pval),
+  FDR  = as.numeric(fdr)
+) %>%
+  dplyr::arrange(FDR)
+
+# 6) 标记共识基因 / DIAMOND 基因（如果存在）
+time_assoc_df <- time_assoc_df %>%
+  dplyr::mutate(
+    IsConsensus = Gene %in% consensus_genes$Gene
+  )
+
+if (exists("diamond_genes")) {
+  time_assoc_df <- time_assoc_df %>%
+    dplyr::mutate(
+      IsDIAMOND = Gene %in% diamond_genes
+    )
+}
+
+# 7) 导出全基因结果
+readr::write_csv(
+  time_assoc_df,
+  file.path(outdir, "TimeAssociation_Spearman_allGenes.csv")
+)
+
+# 8) 取显著基因集合（可以根据需要调整阈值）
+alpha_fdr <- 0.05
+sig_genes <- time_assoc_df %>%
+  dplyr::filter(FDR < alpha_fdr) %>%
+  dplyr::pull(Gene)
+
+message("显著时间相关基因数(FDR < ", alpha_fdr, ")：", length(sig_genes))
+
+readr::write_csv(
+  time_assoc_df %>% dplyr::filter(FDR < alpha_fdr),
+  file.path(outdir, sprintf("TimeAssociation_Spearman_FDR_lt_%0.2f.csv",
+                            alpha_fdr))
+)
+
+# 9) 基因集富集分析：共识基因是否在“时间显著基因”中富集？
+all_genes <- time_assoc_df$Gene
+
+# 共识基因集
+set_consensus <- consensus_genes$Gene
+
+tab_consensus <- matrix(c(
+  sum(all_genes %in% set_consensus & all_genes %in% sig_genes),
+  sum(all_genes %in% set_consensus & !(all_genes %in% sig_genes)),
+  sum(!(all_genes %in% set_consensus) & all_genes %in% sig_genes),
+  sum(!(all_genes %in% set_consensus) & !(all_genes %in% sig_genes))
+), nrow = 2, byrow = TRUE)
+
+dimnames(tab_consensus) <- list(
+  Consensus = c("Yes", "No"),
+  SigTime   = c("Yes", "No")
+)
+
+fisher_consensus <- fisher.test(tab_consensus)
+
+# 若存在 DIAMOND 基因集，也做同样的富集检验
+fisher_diamond <- NULL
+if (exists("diamond_genes")) {
+  set_diamond <- diamond_genes
+  tab_diamond <- matrix(c(
+    sum(all_genes %in% set_diamond & all_genes %in% sig_genes),
+    sum(all_genes %in% set_diamond & !(all_genes %in% sig_genes)),
+    sum(!(all_genes %in% set_diamond) & all_genes %in% sig_genes),
+    sum(!(all_genes %in% set_diamond) & !(all_genes %in% sig_genes))
+  ), nrow = 2, byrow = TRUE)
+  dimnames(tab_diamond) <- list(
+    DIAMOND = c("Yes", "No"),
+    SigTime = c("Yes", "No")
+  )
+  fisher_diamond <- fisher.test(tab_diamond)
+}
+
+# 10) 导出富集检验结果（文本）
+sink(file.path(outdir, "TimeAssociation_GeneSetEnrichment.txt"))
+cat("### 共识基因 vs 时间显著基因 (Spearman, FDR <", alpha_fdr, ")\n\n")
+print(tab_consensus)
+cat("\nFisher's exact test:\n")
+print(fisher_consensus)
+
+if (!is.null(fisher_diamond)) {
+  cat("\n\n### DIAMOND 基因 vs 时间显著基因 (Spearman, FDR <", alpha_fdr, ")\n\n")
+  print(tab_diamond)
+  cat("\nFisher's exact test:\n")
+  print(fisher_diamond)
+}
+sink()
+
+message("显式统计检验模块完成：结果已输出 TimeAssociation_* 和 TimeAssociation_GeneSetEnrichment.*")
+
+############################################################
+## 6C. 显式统计检验结果可视化
+############################################################
+
+message("开始可视化：显式统计检验结果 ...")
+
+## 1) Volcano-style 图：Rho vs -log10(FDR)，高亮共识/DIAMOND 基因 ----
+
+time_assoc_df_plot <- time_assoc_df %>%
+  mutate(
+    negLogFDR = -log10(FDR + 1e-300),   # 避免 log(0)
+    Sig       = FDR < alpha_fdr
+  )
+
+## 先在管道外面判断 DIAMOND 基因集是否存在
+has_diamond <- exists("diamond_genes")
+diamond_set <- if (has_diamond) diamond_genes else character(0)
+
+## 标记类型：普通 / 共识 / DIAMOND
+time_assoc_df_plot <- time_assoc_df %>%
+  mutate(
+    negLogFDR = -log10(FDR + 1e-300),   # 避免 log(0)
+    Sig       = FDR < alpha_fdr,
+    GeneType  = case_when(
+      IsConsensus & Gene %in% diamond_set ~ "Consensus+DIAMOND",
+      IsConsensus                         ~ "Consensus",
+      Gene %in% diamond_set               ~ "DIAMOND",
+      TRUE                                ~ "Other"
+    )
+  )
+
+
+## 配色
+cols_type <- c(
+  "Other"            = "grey80",
+  "Consensus"        = "#1f78b4",
+  "DIAMOND"          = "#33a02c",
+  "Consensus+DIAMOND"= "#e31a1c"
+)
+
+p_volcano <- ggplot(time_assoc_df_plot,
+                    aes(x = Rho, y = negLogFDR)) +
+  geom_hline(yintercept = -log10(alpha_fdr),
+             linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dotted",
+             color = "grey60") +
+  geom_point(aes(color = GeneType),
+             alpha = 0.7, size = 1) +
+  scale_color_manual(values = cols_type) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Time association (Spearman) for all genes",
+    x     = "Spearman ρ (expression ~ day)",
+    y     = expression(-log[10](FDR)),
+    color = "Gene type"
+  )
+
+ggsave(
+  file.path(outdir, "TimeAssociation_Volcano_Rho_vs_negLogFDR.png"),
+  p_volcano,
+  width = 7, height = 5, dpi = 300
+)
+
+## 2) Top 时间相关基因表达热图（按 day 排序，不聚类列） --------------
+
+# 选择 Top 正相关 & Top 负相关基因
+topN_pos <- 60
+topN_neg <- 60
+
+sig_df <- time_assoc_df %>%
+  filter(FDR < alpha_fdr)
+
+top_pos_genes <- sig_df %>%
+  filter(Rho > 0) %>%
+  arrange(FDR) %>%
+  slice_head(n = topN_pos) %>%
+  pull(Gene)
+
+top_neg_genes <- sig_df %>%
+  filter(Rho < 0) %>%
+  arrange(FDR) %>%
+  slice_head(n = topN_neg) %>%
+  pull(Gene)
+
+genes_top_time <- unique(c(top_pos_genes, top_neg_genes))
+genes_top_time <- intersect(genes_top_time, rownames(cpm_mat))
+
+message("用于时间相关热图的基因数：", length(genes_top_time))
+
+if (length(genes_top_time) >= 2) {
+  # 表达矩阵：行=基因，列=样本
+  expr_top <- cpm_mat[genes_top_time, , drop = FALSE]
+  
+  # 列按 day 从小到大排序，不做列聚类
+  ord_samples <- order(meta$day)
+  expr_top_ord <- expr_top[, ord_samples, drop = FALSE]
+  
+  ann_col <- meta %>%
+    dplyr::select(sample, day) %>%
+    tibble::column_to_rownames("sample")
+  ann_col <- ann_col[colnames(expr_top_ord), , drop = FALSE]
+  
+  stopifnot(all(colnames(expr_top_ord) == rownames(ann_col)))
+  
+  pdf(file.path(outdir,
+                sprintf("TimeAssociation_Heatmap_TopPos%d_TopNeg%d.pdf",
+                        topN_pos, topN_neg)),
+      width = 8, height = 8)
+  pheatmap(
+    expr_top_ord,
+    scale                    = "row",
+    clustering_distance_rows = "euclidean",
+    clustering_method        = "complete",
+    clustering_distance_cols = "euclidean",  # 不用列聚类，由 cluster_cols 控制
+    cluster_cols             = FALSE,        # 列不聚类，按 day 排序展示
+    show_rownames            = TRUE,
+    show_colnames            = FALSE,
+    annotation_col           = ann_col,
+    main = sprintf(
+      "Top time-associated genes (Spearman, FDR<%.2f)",
+      alpha_fdr
+    )
+  )
+  dev.off()
+} else {
+  message("显著时间相关基因数过少，跳过 Top 时间相关基因热图。")
+}
+
+## 3) 共识/DIAMOND 基因的时间热图（列按 day，专门看候选集） ---------
+
+# 3.1 共识基因热图
+genes_consensus_in_mat <- intersect(consensus_genes$Gene,
+                                    rownames(cpm_mat))
+
+if (length(genes_consensus_in_mat) >= 2) {
+  expr_consensus_ord <- cpm_mat[genes_consensus_in_mat, , drop = FALSE]
+  ord_samples <- order(meta$day)
+  expr_consensus_ord <- expr_consensus_ord[, ord_samples, drop = FALSE]
+  
+  ann_col <- meta %>%
+    dplyr::select(sample, day) %>%
+    tibble::column_to_rownames("sample")
+  ann_col <- ann_col[colnames(expr_consensus_ord), , drop = FALSE]
+  
+  stopifnot(all(colnames(expr_consensus_ord) == rownames(ann_col)))
+  
+  pdf(file.path(outdir,
+                "ConsensusGenes_TimeCourse_Heatmap_noColCluster.pdf"),
+      width = 8, height = 8)
+  pheatmap(
+    expr_consensus_ord,
+    scale                    = "row",
+    clustering_distance_rows = "euclidean",
+    clustering_method        = "complete",
+    cluster_cols             = FALSE,  # 列不聚类，按 day 顺序
+    show_rownames            = TRUE,
+    show_colnames            = FALSE,
+    annotation_col           = ann_col,
+    main = sprintf(
+      "Consensus genes (k ≥ %d) time-course (log2CPM)", consensus_k
+    )
+  )
+  dev.off()
+}
+
+# 3.2 DIAMOND 基因热图（如果存在 diamond_genes）
+if (exists("diamond_genes")) {
+  genes_diamond_in_mat <- intersect(diamond_genes, rownames(cpm_mat))
+  
+  if (length(genes_diamond_in_mat) >= 2) {
+    expr_diamond_ord <- cpm_mat[genes_diamond_in_mat, , drop = FALSE]
+    ord_samples <- order(meta$day)
+    expr_diamond_ord <- expr_diamond_ord[, ord_samples, drop = FALSE]
+    
+    ann_col <- meta %>%
+      dplyr::select(sample, day) %>%
+      tibble::column_to_rownames("sample")
+    ann_col <- ann_col[colnames(expr_diamond_ord), , drop = FALSE]
+    
+    stopifnot(all(colnames(expr_diamond_ord) == rownames(ann_col)))
+    
+    pdf(file.path(outdir,
+                  "DIAMONDgenes_TimeCourse_Heatmap_noColCluster.pdf"),
+        width = 8, height = 8)
+    pheatmap(
+      expr_diamond_ord,
+      scale                    = "row",
+      clustering_distance_rows = "euclidean",
+      clustering_method        = "complete",
+      cluster_cols             = FALSE,
+      show_rownames            = TRUE,
+      show_colnames            = FALSE,
+      annotation_col           = ann_col,
+      main = "DIAMOND genes time-course (log2CPM)"
+    )
+    dev.off()
+  } else {
+    message("DIAMOND 基因在表达矩阵中 < 2，跳过 DIAMOND 热图。")
+  }
+}
+
+message("6C 可视化完成：Volcano + 时间热图已输出到 ", outdir)
+
+############################################################
+## 6D. |ρ| 效应量阈值敏感性分析
+############################################################
+
+## 1) 计算 ECDF
+time_assoc_df <- time_assoc_df %>% mutate(absRho = abs(Rho))
+
+## 2) |ρ| 阈值 vs 显著基因数
+rho_cut_seq <- seq(0, 0.9, by = 0.05)
+n_sig <- sapply(rho_cut_seq, function(rho_cut) {
+  sum(time_assoc_df$FDR < 0.05 & time_assoc_df$absRho >= rho_cut, na.rm = TRUE)
+})
+rho_sens_df <- tibble(rho_cut = rho_cut_seq, n_sig = n_sig)
+
+## 3) ECDF
+ecdf_df <- time_assoc_df %>%
+  arrange(absRho) %>%
+  mutate(ecdf = seq_along(absRho) / n())
+
+## 4) 两图合并 PDF
+pdf(file.path(outdir, "Rho_threshold_sensitivity.pdf"), width = 8, height = 4)
+gridExtra::grid.arrange(
+  ggplot(rho_sens_df, aes(rho_cut, n_sig)) +
+    geom_line(linewidth = 1) +
+    geom_vline(xintercept = 0.3, linetype = 2, color = "red") +
+    labs(x = "|Spearman ρ| cutoff", y = "No. of significant genes (FDR<0.05)") +
+    theme_bw(),
+  ggplot(ecdf_df, aes(absRho, ecdf)) +
+    geom_step(linewidth = 1) +
+    geom_vline(xintercept = 0.3, linetype = 2, color = "red") +
+    labs(x = "|Spearman ρ|", y = "ECDF") +
+    theme_bw(),
+  ncol = 2
+)
+dev.off()
+
+## 5) 输出高置信基因列表 (|ρ|≥0.3 & FDR<0.05)
+high_conf_genes <- time_assoc_df %>%
+  filter(FDR < 0.05, absRho >= 0.3) %>%
+  pull(Gene)
+write_csv(tibble(Gene = high_conf_genes),
+          file.path(outdir, "HighConfidence_genes_rho_ge_0.3_FDR_lt_0.05.csv"))
+cat("高置信基因（|ρ|≥0.3 & FDR<0.05）：", length(high_conf_genes), "\n")
+
+message("整条整合流程运行结束。结果已输出到：\n", outdir)
+
+############################################################
+## 6E. GAM/spline 非线性时间拟合
+##      候选基因 = 高置信时间基因 ∩ 11 模型 union_genes_all
+############################################################
+
+message("开始 GAM/spline 非线性时间拟合（候选基因） ...")
+
+## 1) 定义候选基因集合 ---------------------------------------
+##    union_genes_all：11 个模型 TopN 的并集（<= 11*topN）
+##    high_conf_genes：6D 中 |ρ|≥阈值 且 FDR<0.05 的高置信时间基因
+
+# 先限制到表达矩阵中真正存在的基因
+genes_ml_union   <- intersect(union_genes_all, rownames(cpm_mat))
+genes_time_high  <- intersect(high_conf_genes, rownames(cpm_mat))
+
+# 最终用于 GAM 的候选集 = 二者交集
+candidate_genes_gam <- intersect(genes_ml_union, genes_time_high)
+
+message("用于 GAM 拟合的候选基因数：", length(candidate_genes_gam))
+
+if (length(candidate_genes_gam) >= 3) {
+  
+  ## 2) 基于 log2CPM 的表达矩阵和时间向量 --------------------
+  expr_mat_gam <- cpm_mat        # 行=基因, 列=样本
+  day_vec_gam  <- meta$day       # 与列顺序一致
+  
+  stopifnot(all(colnames(expr_mat_gam) == meta$sample))
+  
+  ## 3) 对每个候选基因拟合线性模型 vs GAM --------------------
+  ##    expr ~ day  (线性)
+  ##    expr ~ s(day) (非线性平滑)
+  ##    比较 AIC 与 ANOVA(F)，评估非线性显著性
+  
+  k_spline <- 4   # 平滑基函数自由度，可按需要调整
+  
+  gam_res_list <- purrr::map(candidate_genes_gam, function(g) {
+    z <- as.numeric(expr_mat_gam[g, ])
+    df <- data.frame(expr = z, day = as.numeric(day_vec_gam))
+    
+    ## 线性模型
+    lm_fit  <- lm(expr ~ day, data = df)
+    
+    ## GAM 模型（非线性）
+    gam_fit <- mgcv::gam(expr ~ s(day, k = k_spline),
+                         data = df, method = "REML")
+    
+    ## 比较：线性 vs GAM
+    an  <- anova(lm_fit, gam_fit, test = "F")
+    p_nonlin <- tryCatch(
+      an$`Pr(>F)`[2],
+      error = function(e) NA_real_
+    )
+    
+    aic_lm  <- AIC(lm_fit)
+    aic_gam <- AIC(gam_fit)
+    dAIC    <- aic_lm - aic_gam      # >0 说明 GAM 更优
+    dev_expl <- summary(gam_fit)$dev.expl  # GAM 解释的偏差比例
+    
+    tibble(
+      Gene       = g,
+      AIC_lm     = aic_lm,
+      AIC_gam    = aic_gam,
+      dAIC       = dAIC,
+      DevExpl_gam= dev_expl,
+      P_nonlin   = p_nonlin
+    )
+  })
+  
+  gam_res <- bind_rows(gam_res_list) %>%
+    mutate(
+      FDR_nonlin = p.adjust(P_nonlin, method = "BH")
+    ) %>%
+    arrange(FDR_nonlin)
+  
+  ## 4) 导出所有候选基因的 GAM 结果 -------------------------
+  readr::write_csv(
+    gam_res,
+    file.path(outdir, "GAM_NonlinearTime_CandidateGenes_unionAll_and_HighConf.csv")
+  )
+  
+  ## 5) 筛选“显著非线性时间基因”
+  ##    条件示例：FDR_nonlin < 0.05 且 dAIC > 2
+  gam_sig <- gam_res %>%
+    filter(!is.na(FDR_nonlin),
+           FDR_nonlin < 0.05,
+           dAIC > 2)
+  
+  message("显著非线性时间基因数 (FDR_nonlin < 0.05 & dAIC > 2)：",
+          nrow(gam_sig))
+  
+  readr::write_csv(
+    gam_sig,
+    file.path(outdir,
+              "GAM_NonlinearTime_SignificantGenes_unionAll_and_HighConf.csv")
+  )
+  
+  ## 6) 可视化：Top 非线性时间基因的 GAM 拟合曲线 ------------
+  n_plot <- 12
+  top_gam_genes <- gam_sig %>%
+    slice_head(n = min(n_plot, nrow(.))) %>%
+    pull(Gene)
+  
+  if (length(top_gam_genes) > 0) {
+    plot_df <- purrr::map_df(top_gam_genes, function(g) {
+      tibble(
+        Gene = g,
+        Day  = as.numeric(day_vec_gam),
+        Expr = as.numeric(expr_mat_gam[g, ])
+      )
+    })
+    
+    p_gam <- ggplot(plot_df, aes(x = Day, y = Expr)) +
+      geom_point(alpha = 0.5, size = 1) +
+      geom_smooth(method = "gam",
+                  formula = y ~ s(x, k = k_spline),
+                  se = TRUE) +
+      facet_wrap(~ Gene, scales = "free_y") +
+      theme_bw(base_size = 11) +
+      labs(
+        title = "Top non-linear time genes (GAM fits on log2CPM)",
+        x     = "Day",
+        y     = "log2(CPM+1)"
+      )
+    
+    ggsave(
+      file.path(outdir,
+                sprintf("GAM_TopNonlinearGenes_unionAll_and_HighConf_top%d.pdf",
+                        length(top_gam_genes))),
+      p_gam,
+      width = 10, height = 8
+    )
+  } else {
+    message("无满足阈值的显著非线性基因，跳过 GAM 曲线可视化。")
+  }
+  
+} else {
+  message("候选基因数 < 3，跳过 GAM 非线性时间拟合模块。")
+}
+
+
+message("6E GAM/spline 非线性时间拟合完成。")
+
