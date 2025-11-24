@@ -19,5 +19,5 @@ This script contains complete code for data preprocessing, modeling, saliency an
 包含 LOPO（Leave-One-Day-Out）验证、Nested-CV 嵌套交叉验证、PC1 轨迹可视化等
 本脚本包含数据预处理、建模、显著性分析与可视化的完整代码
 
-<img width="1024" height="1024" alt="ChatGPT Image Nov 24, 2025, 11_26_40 AM" src="https://github.com/user-attachments/assets/8a070522-acd4-46f2-91cb-37e208d0fc6d" />
+<img width="4267" height="4267" alt="ChatGPT Image Nov 24, 2025, 11_26_40 AM2  转换" src="https://github.com/user-attachments/assets/8c5c25e6-a767-4ae5-8202-3e39b90bc52c" />
 
